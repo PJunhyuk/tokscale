@@ -78,7 +78,7 @@ pub struct CodexPayload {
     /// Usage of one model response on a `token_usage_record` item. The
     /// token_count stream normally reports the same response right after it,
     /// so the record only counts when no token_count confirms it; see
-    /// [`CodexParseState::pending_usage_record`]. Also a service-tier
+    /// `CodexParseState::pending_usage_record`. Also a service-tier
     /// forward-compat arm in case Codex stamps the tier here.
     pub usage: Option<CodexTokenUsage>,
     /// `token_usage_record` only: the response the usage belongs to.
