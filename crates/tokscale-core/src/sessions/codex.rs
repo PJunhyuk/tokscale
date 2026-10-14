@@ -436,6 +436,10 @@ pub(crate) struct CodexPendingUsageRecord {
     /// it (see [`CodexParseState::pending_usage_record`]).
     #[serde(default)]
     after_compacted: bool,
+    /// The record came after a human `user_message` that no usage row has
+    /// marked yet, so if it is emitted it is the turn's first reply.
+    #[serde(default)]
+    turn_start: bool,
 }
 
 impl CodexPendingUsageRecord {
@@ -636,11 +640,9 @@ fn parse_codex_reader<R: BufRead>(
                         .is_some_and(|(thread, own)| thread != own);
                     if !state.forked_child_waiting_for_turn_context && !from_other_thread {
                         let service_tier = extract_request_service_tier(&payload);
-                        if let Some(service_tier) = service_tier.clone() {
-                            state.request_service_tier = Some(service_tier);
-                        }
                         // A record still pending here never got its
-                        // token_count, so its usage is counted from it now.
+                        // token_count, so its usage is counted from it now,
+                        // before this record's tier becomes the request tier.
                         emit_unconfirmed_usage_record(
                             &mut state,
                             session_id,
@@ -649,6 +651,9 @@ fn parse_codex_reader<R: BufRead>(
                             &mut fallback_timestamp_indices,
                             &mut pending_model_messages,
                         );
+                        if let Some(service_tier) = service_tier.clone() {
+                            state.request_service_tier = Some(service_tier);
+                        }
                         state.pending_usage_record = payload
                             .usage
                             .as_ref()
@@ -666,7 +671,13 @@ fn parse_codex_reader<R: BufRead>(
                                 service_tier,
                                 model: extract_model(&payload),
                                 after_compacted: false,
+                                turn_start: state.pending_turn_start,
                             });
+                        // A held record is a usage ledger even before it is
+                        // settled, so the rollout is not reported as unmetered.
+                        if state.pending_usage_record.is_some() {
+                            state.has_supported_usage = true;
+                        }
                     }
                     continue;
                 }
@@ -682,8 +693,10 @@ fn parse_codex_reader<R: BufRead>(
                     }
                     let starts_other_turn = (entry.entry_type == "event_msg"
                         && payload.payload_type.as_deref() == Some("task_started"))
+                        // A `turn_context` without an id starts a turn of its
+                        // own unless a `task_started` just announced it, and
+                        // that `task_started` has already settled the record.
                         || (entry.entry_type == "turn_context"
-                            && payload.turn_id.is_some()
                             && state
                                 .pending_usage_record
                                 .as_ref()
@@ -1368,6 +1381,12 @@ fn emit_unconfirmed_usage_record(
     let timestamp = record.timestamp_ms.unwrap_or(fallback_timestamp);
     let mut message =
         new_codex_usage_message(state, session_id, model.as_deref(), timestamp, tokens);
+    // The first reply after human input marks the turn start, as on the
+    // token_count path; a mark left for a later turn is not taken.
+    if record.turn_start && state.pending_turn_start {
+        message.is_turn_start = true;
+        state.pending_turn_start = false;
+    }
     message.service_tier = record
         .service_tier
         .clone()
@@ -5100,5 +5119,87 @@ mod tests {
         assert_eq!(turn_totals(&parsed.messages), vec![110, 540]);
         assert!(parsed.state.turn_coverage.turn_ids.contains("turn-2"));
         assert!(parsed.state.pending_usage_record.is_some());
+    }
+
+    #[test]
+    fn test_unconfirmed_record_keeps_its_own_tier_when_the_next_record_names_one() {
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
+                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
+                + &format!(
+                    r#"{{"timestamp":"2026-10-01T00:01:06Z","type":"token_usage_record","payload":{{"thread_id":"{COMPACTION_THREAD}","turn_id":"turn-1","response_id":"resp-2","usage":{{"input_tokens":30,"cached_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":0,"total_tokens":33,"service_tier":"priority"}}}}}}"#
+                )
+                + "\n"
+                + &token_count_line("2026-10-01T00:01:06.005Z", (30, 0, 3), (30, 0, 3))),
+        );
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(turn_totals(&messages), vec![110, 33]);
+        assert_eq!(messages[0].service_tier, None, "resp-1 named no tier");
+        assert_eq!(messages[1].service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn test_record_pending_at_end_of_file_still_counts_as_a_usage_ledger() {
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
+                + UNMETERED_ACTIVITY
+                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))),
+        );
+
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.state.has_supported_usage);
+        assert!(!parsed.is_missing_usage());
+    }
+
+    #[test]
+    fn test_turn_context_without_turn_id_ends_the_previous_turns_wait() {
+        // A `turn_context` without an id, and no `task_started` before it,
+        // starts another turn; the previous turn's record is settled there
+        // instead of being taken as confirmed by the new turn's token_count.
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
+                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
+                + r#"{"timestamp":"2026-10-01T00:02:00Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#
+                + "\n"
+                + &token_count_line("2026-10-01T00:02:05.005Z", (30, 0, 3), (30, 0, 3))),
+        );
+
+        assert_eq!(turn_totals(&parse_codex_file(file.path())), vec![110, 33]);
+    }
+
+    #[test]
+    fn test_unconfirmed_record_after_human_message_is_the_turn_start() {
+        let user_message = r#"{"timestamp":"2026-10-01T00:02:00.001Z","type":"event_msg","payload":{"type":"user_message","message":"summarize the log"}}"#.to_string() + "\n";
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:02:00Z", "turn-2")
+                + &user_message
+                + &record_line(
+                    "2026-10-01T00:02:00.005Z",
+                    "turn-2",
+                    "resp-c",
+                    (500, 200, 40),
+                )
+                + &compacted_line("2026-10-01T00:02:00.010Z")
+                + &estimate_token_count_line("2026-10-01T00:02:00.020Z", (0, 0, 0), 15823)
+                + &record_line("2026-10-01T00:02:05Z", "turn-2", "resp-2", (30, 0, 3))
+                + &token_count_line("2026-10-01T00:02:05.005Z", (30, 0, 3), (30, 0, 3))),
+        );
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(turn_totals(&messages), vec![540, 33]);
+        assert!(
+            messages[0].is_turn_start,
+            "the compaction is the first reply"
+        );
+        assert!(!messages[1].is_turn_start);
     }
 }
