@@ -1350,7 +1350,12 @@ fn parser_version(client: ClientId) -> u32 {
         // v12->v13: also retain gateway activity for Synthetic-only scans.
         // v13->v14: support zstd-compressed transcripts (`.jsonl.zst`) in
         // Codex sessions and archives.
-        ClientId::Codex => 14,
+        // v14->v15: a `token_usage_record` that no token_count confirms (a
+        // context compaction request, or a response whose turn ended before
+        // its token_count) is now counted from the record. A finished rollout
+        // never changes, so a v14 entry would keep serving the totals without
+        // those responses. OpenClaw's codex-home rollouts share this identity.
+        ClientId::Codex => 15,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -4558,9 +4563,10 @@ mod tests {
         // v10->v11 resets duration anchors at standalone task_started events.
         // v11->v13 retains source completeness and gateway activity for empty
         // results, and v13->v14 decodes compressed archives (.jsonl.zst).
+        // v14->v15 counts usage records no token_count confirms (compaction).
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 14);
+        assert_eq!(parser_version(ClientId::Codex), 15);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -4989,6 +4995,101 @@ mod tests {
         cache.save_if_dirty();
         let warm = SourceMessageCache::load();
         assert_eq!(warm.get(identity, &source).unwrap().messages, parsed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_v14_shards_are_reparsed_with_compaction_usage_records() {
+        // A context compaction request's usage is only in its
+        // `token_usage_record`; the token_count after `compacted` does not
+        // advance. A finished rollout keeps its fingerprint, and the loader
+        // serves a nonempty entry for an unchanged file without calling the
+        // parser, so only the version bump can retire a v14 entry that holds
+        // the rollout without the compaction.
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = temp_home
+            .path()
+            .join("rollout-2026-10-01T00-00-00-01a0f000-0000-7000-8000-000000000001.jsonl");
+        fs::write(
+            &source,
+            br#"{"timestamp":"2026-10-01T00:00:00Z","type":"session_meta","payload":{"id":"01a0f000-0000-7000-8000-000000000001","originator":"codex_vscode","source":"vscode","model_provider":"openai"}}
+{"timestamp":"2026-10-01T00:01:00Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}
+{"timestamp":"2026-10-01T00:01:05Z","type":"token_usage_record","payload":{"turn_id":"turn-1","response_id":"resp-1","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}
+{"timestamp":"2026-10-01T00:01:05.005Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}}
+{"timestamp":"2026-10-01T00:02:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"timestamp":"2026-10-01T00:02:00.005Z","type":"token_usage_record","payload":{"turn_id":"turn-2","response_id":"resp-2","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":40,"total_tokens":540}}}
+{"timestamp":"2026-10-01T00:02:00.010Z","type":"compacted","payload":{"message":"","replacement_history":[]}}
+{"timestamp":"2026-10-01T00:02:00.020Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}}
+"#,
+        )
+        .unwrap();
+
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let stale_identity = CacheIdentity {
+            parser_version: 14,
+            ..identity
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        // What v14 cached: the token_count row of turn 1 only.
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            vec![UnifiedMessage::new(
+                identity.namespace,
+                "gpt-5.5",
+                "openai",
+                "01a0f000-0000-7000-8000-000000000001",
+                1790812865000,
+                TokenBreakdown {
+                    input: 20,
+                    output: 10,
+                    cache_read: 80,
+                    cache_write: 0,
+                    cache_write_1h: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            )],
+            Vec::new(),
+            None,
+        );
+        let shard = cache_shard_path(identity, &source);
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(identity, &source).is_none(),
+            "a v14 entry lacks the compaction's usage and must not be served"
+        );
+        assert_eq!(SourceFingerprint::from_path(&source).unwrap(), fingerprint);
+        let parsed = crate::sessions::codex::parse_codex_file(&source);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed.iter().map(|m| m.tokens.total()).sum::<i64>(),
+            110 + 540
+        );
+        cache.insert(CachedSourceEntry::new(
+            identity,
+            &source,
+            fingerprint,
+            parsed.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+        let warm = SourceMessageCache::load();
+        let cached = warm.get(identity, &source).unwrap();
+        assert_eq!(cached.parser_version, 15);
+        assert_eq!(cached.messages, parsed);
     }
 
     #[test]
