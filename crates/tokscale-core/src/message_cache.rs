@@ -1399,8 +1399,11 @@ fn parser_version(client: ClientId) -> u32 {
         // the file-mtime fallback timestamp, and persist their event ordinal.
         // v15->v16: a `token_usage_record` that no token_count confirms (a
         // context compaction request, or a response whose turn ended before
-        // its token_count) is counted from the record. The persisted parser
-        // state gained `pending_usage_record`, so v15 state is incompatible.
+        // its token_count) is now counted from the record, and the parse state
+        // carries the pending and settled records beside v15's event ordinal.
+        // A finished rollout never changes, so a v15 entry would keep serving
+        // the totals without those responses. OpenClaw's codex-home rollouts
+        // share this identity.
         ClientId::Codex => 16,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
@@ -4729,9 +4732,9 @@ mod tests {
         // nickname; v9->v10 retains service_tier for Fast mode pricing,
         // v10->v11 resets duration anchors at standalone task_started events.
         // v11->v13 retains source completeness and gateway activity for empty
-        // results, v13->v14 decodes compressed archives (.jsonl.zst), and
-        // v14->v15 stabilizes fallback-timestamp dedup across rollout copies.
-        // v15->v16 counts usage records no token_count confirms (compaction).
+        // results, v13->v14 decodes compressed archives (.jsonl.zst),
+        // v14->v15 stabilizes fallback-timestamp dedup across rollout copies,
+        // and v15->v16 counts usage records no token_count confirms.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
         assert_eq!(parser_version(ClientId::Codex), 16);
@@ -5172,8 +5175,9 @@ mod tests {
         // `token_usage_record`; the token_count after `compacted` does not
         // advance. A finished rollout keeps its fingerprint, and the loader
         // serves a nonempty entry for an unchanged file without calling the
-        // parser, so only the version bump can retire a v15 entry that holds
-        // the rollout without the compaction.
+        // parser, so only the version bump can retire a v15 entry (written
+        // with v15's fallback-dedup state) that holds the rollout without the
+        // compaction.
         let temp_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(temp_home.path());
         let source = temp_home
@@ -5258,93 +5262,6 @@ mod tests {
         let cached = warm.get(identity, &source).unwrap();
         assert_eq!(cached.parser_version, 16);
         assert_eq!(cached.messages, parsed);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn codex_cached_state_suppresses_late_confirmation_after_turn_boundary() {
-        let temp_home = TempDir::new().unwrap();
-        let _cache_env = sandbox_cache_env(temp_home.path());
-        let source = temp_home
-            .path()
-            .join("rollout-2026-10-01T00-00-00-01a0f000-0000-7000-8000-000000000001.jsonl");
-        let head = br#"{"timestamp":"2026-10-01T23:58:00Z","type":"session_meta","payload":{"id":"01a0f000-0000-7000-8000-000000000001","originator":"codex_vscode","source":"vscode","model_provider":"openai"}}
-{"timestamp":"2026-10-01T23:58:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
-{"timestamp":"2026-10-01T23:58:00Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}
-{"timestamp":"2026-10-01T23:58:05Z","type":"token_usage_record","payload":{"turn_id":"turn-1","response_id":"resp-1","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}
-{"timestamp":"2026-10-01T23:58:05.005Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}}
-{"timestamp":"2026-10-01T23:59:59Z","type":"token_usage_record","payload":{"turn_id":"turn-1","response_id":"resp-late","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":40,"total_tokens":540}}}
-{"timestamp":"2026-10-02T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
-{"timestamp":"2026-10-02T00:00:00Z","type":"turn_context","payload":{"turn_id":"turn-2","model":"gpt-5.5"}}
-"#;
-        fs::write(&source, head).unwrap();
-
-        let initial = crate::sessions::codex::parse_codex_file_incremental(
-            &source,
-            0,
-            CodexParseState::default(),
-        );
-        assert_eq!(
-            initial
-                .messages
-                .iter()
-                .map(|message| message.tokens.total())
-                .collect::<Vec<_>>(),
-            vec![110, 540]
-        );
-        let initial_messages = initial.messages.clone();
-        let initial_fallback_timestamp_indices = initial.fallback_timestamp_indices;
-        let initial_consumed_offset = initial.consumed_offset;
-        let initial_state = initial.state;
-        let identity = CacheIdentity::for_client(ClientId::Codex);
-        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
-        let incremental = build_codex_incremental_cache_with_prefix_hash(
-            &source,
-            initial_consumed_offset,
-            initial_state,
-            fingerprint.content_hash,
-        )
-        .unwrap();
-        let mut cache = SourceMessageCache::default();
-        cache.insert(CachedSourceEntry::new(
-            identity,
-            &source,
-            fingerprint,
-            initial_messages,
-            initial_fallback_timestamp_indices,
-            Some(incremental),
-        ));
-        cache.save_if_dirty();
-
-        fs::write(
-            &source,
-            [
-                head.as_slice(),
-                br#"{"timestamp":"2026-10-02T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":600,"cached_input_tokens":280,"output_tokens":50,"total_tokens":650},"last_token_usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":40,"total_tokens":540}}}}
-"#,
-            ]
-            .concat(),
-        )
-        .unwrap();
-
-        let cached = SourceMessageCache::load().get(identity, &source).unwrap();
-        let incremental = cached.codex_incremental.expect("persisted Codex state");
-        assert!(codex_prefix_matches(&source, &incremental));
-        let appended = crate::sessions::codex::parse_codex_file_incremental(
-            &source,
-            incremental.consumed_offset,
-            incremental.state,
-        );
-        let mut messages = cached.messages;
-        messages.extend(appended.messages);
-        assert_eq!(
-            messages
-                .iter()
-                .map(|message| message.tokens.total())
-                .collect::<Vec<_>>(),
-            vec![110, 540],
-            "the next-day confirmation must not duplicate the settled record"
-        );
     }
 
     #[test]

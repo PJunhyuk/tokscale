@@ -216,6 +216,14 @@ impl CodexTotals {
         })
     }
 
+    /// Whether two usage reports describe the same response: input and output
+    /// must each match. The cached split of the input and the reasoning share
+    /// of the output are not compared, since those are the parts a
+    /// `token_usage_record` and a `token_count` may report differently.
+    fn reports_same_response(self, other: Self) -> bool {
+        self.input == other.input && self.output == other.output
+    }
+
     fn saturating_add(self, other: Self) -> Self {
         Self {
             input: self.input.saturating_add(other.input),
@@ -401,22 +409,25 @@ pub(crate) struct CodexParseState {
     /// followed by a `compacted` item and a token_count that does not advance
     /// the totals, so the compaction's tokens appear in the record alone. A
     /// response whose turn ended before its token_count was written leaves
-    /// the same trace. The record is therefore held here and
-    /// - dropped as already counted when the next token_count that emits
-    ///   usage arrives, or when the next token_count is a forked child's
-    ///   replayed parent snapshot (the record is the parent's, too),
-    /// - emitted as its own usage when the next `token_usage_record` or the
-    ///   start of another turn arrives first, and
-    /// - after a `compacted` item, settled by the next token_count: a replayed
-    ///   parent snapshot drops it, a token_count that emits usage and reports
-    ///   this response (same input and output) confirms it, and any other
-    ///   token_count (Codex's non-advancing estimate after compaction) means
-    ///   the compaction's tokens are in the record alone, so it is emitted.
+    /// the same trace. The record is therefore held here and settled against
+    /// the usage the next token_count actually emits, whichever form that
+    /// token_count takes (cumulative and last, total-only delta, last-only):
+    /// - a token_count whose emitted usage reports this response (input and
+    ///   output each equal; the cached and reasoning splits may differ)
+    ///   confirms it, and the response is counted once, from the token_count;
+    /// - a forked child's replayed parent snapshot drops it, since the record
+    ///   is part of the same replay;
+    /// - the next `token_usage_record` or the start of another turn arriving
+    ///   first emits it as its own usage row, and so does, after a `compacted`
+    ///   item, a token_count that emits nothing (Codex's non-advancing
+    ///   estimate) or reports a different response.
     ///
-    /// Outside compaction a token_count that emits usage confirms the record
-    /// by order alone: in every rollout measured its `last_token_usage` equals
-    /// the record, and reading a mismatch as "unconfirmed" would count every
-    /// response twice if Codex ever reported the two differently.
+    /// Outside compaction, a token_count that emits a different response still
+    /// confirms the record by order: in every rollout measured the two are
+    /// equal, and reading a mismatch as "unconfirmed" would count every
+    /// response twice if Codex ever reported them differently. A token_count
+    /// that reports a record already emitted on its own is recognized through
+    /// [`CodexParseState::settled_usage_records`] instead.
     ///
     /// A record whose `thread_id` names another thread is never held: this
     /// rollout's token_counts do not report it, and its own thread counts it.
@@ -427,47 +438,19 @@ pub(crate) struct CodexParseState {
     /// keeps it across incremental re-parses.
     #[serde(default)]
     pub pending_usage_record: Option<CodexPendingUsageRecord>,
-    /// Recently emitted records that may still be followed by a delayed
-    /// token_count. Kept across incremental cache reads so that confirmation
-    /// does not double-count the already emitted record.
+    /// Usage of the latest records emitted on their own, at most
+    /// [`SETTLED_USAGE_RECORD_LIMIT`], oldest first.
+    ///
+    /// A record is emitted when the next turn or record arrives before its
+    /// token_count, so its token_count can still come later. Such a late
+    /// report would otherwise count the response a second time, with a
+    /// different key and possibly in another day. A token_count whose emitted
+    /// usage matches an entry is taken as that late report: it advances the
+    /// baseline, emits nothing, and consumes the entry. `#[serde(default)]`
+    /// keeps the entries across incremental re-parses, so a late report in an
+    /// appended chunk is recognized as well.
     #[serde(default)]
-    settled_usage_records: std::collections::VecDeque<CodexSettledUsageRecord>,
-}
-
-const MAX_SETTLED_USAGE_RECORDS: usize = 16;
-
-/// A bounded identity for an unconfirmed record that was emitted before its
-/// delayed token_count appeared. `response_id` and `turn_id` document which
-/// response was settled; Codex does not put either on token_count, so its
-/// compatible input/output counters perform the wire-side match.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct CodexSettledUsageRecord {
-    usage: CodexTotals,
-    response_id: Option<String>,
-    turn_id: Option<String>,
-}
-
-impl CodexParseState {
-    fn remember_settled_usage_record(&mut self, record: &CodexPendingUsageRecord) {
-        self.settled_usage_records
-            .push_back(CodexSettledUsageRecord {
-                usage: record.usage,
-                response_id: record.response_id.clone(),
-                turn_id: record.turn_id.clone(),
-            });
-        while self.settled_usage_records.len() > MAX_SETTLED_USAGE_RECORDS {
-            self.settled_usage_records.pop_front();
-        }
-    }
-
-    fn take_settled_usage_record_reported_by(&mut self, reported: CodexTotals) -> bool {
-        let Some(index) = self.settled_usage_records.iter().position(|record| {
-            record.usage.input == reported.input && record.usage.output == reported.output
-        }) else {
-            return false;
-        };
-        self.settled_usage_records.remove(index).is_some()
-    }
+    pub settled_usage_records: std::collections::VecDeque<CodexTotals>,
 }
 
 /// A `token_usage_record` waiting for a token_count to confirm it; see
@@ -494,43 +477,15 @@ pub(crate) struct CodexPendingUsageRecord {
 }
 
 impl CodexPendingUsageRecord {
-    /// Whether a token_count's `last_token_usage` reports this record's
-    /// response. Input and output are compared, not the cached split, which
-    /// is the part of the counters most likely to be reported differently.
-    fn reported_by(&self, last: CodexTotals) -> bool {
-        self.usage.input == last.input && self.usage.output == last.output
+    /// Whether usage a token_count emits reports this record's response.
+    fn reported_by(&self, emitted: CodexTotals) -> bool {
+        self.usage.reports_same_response(emitted)
     }
 }
 
-/// The raw usage a token_count will emit, before model attribution and before
-/// a zero-token row is suppressed. This mirrors the accounting match below so
-/// compaction records settle against last-only and total-only fallbacks too.
-fn token_count_emitted_usage(
-    total_usage: Option<CodexTotals>,
-    last_usage: Option<CodexTotals>,
-    previous_totals: Option<CodexTotals>,
-) -> Option<CodexTotals> {
-    match (total_usage, last_usage, previous_totals) {
-        (Some(total), Some(last), Some(previous)) => {
-            if total == previous
-                || (total.delta_from(previous).is_none()
-                    && total.looks_like_stale_regression(previous, last))
-            {
-                None
-            } else {
-                Some(last)
-            }
-        }
-        (Some(_total), Some(last), None) => Some(last),
-        (Some(total), None, Some(previous)) => {
-            (total != previous).then_some(())?;
-            total.delta_from(previous)
-        }
-        (Some(total), None, None) => Some(total),
-        (None, Some(last), _) => Some(last),
-        (None, None, _) => None,
-    }
-}
+/// How many records emitted on their own are remembered for a late
+/// token_count (see [`CodexParseState::settled_usage_records`]).
+const SETTLED_USAGE_RECORD_LIMIT: usize = 16;
 
 /// Which of a thread's turns a rollout recorded usage for.
 ///
@@ -766,6 +721,27 @@ fn archive_limit_for_path(_path: &Path) -> u64 {
 }
 
 impl CodexParseState {
+    /// Consume the settled record `emitted` reports, if there is one; see
+    /// [`CodexParseState::settled_usage_records`].
+    fn take_settled_usage_record(&mut self, emitted: CodexTotals) -> bool {
+        let Some(index) = self
+            .settled_usage_records
+            .iter()
+            .position(|usage| usage.reports_same_response(emitted))
+        else {
+            return false;
+        };
+        self.settled_usage_records.remove(index);
+        true
+    }
+
+    fn remember_settled_usage_record(&mut self, usage: CodexTotals) {
+        if self.settled_usage_records.len() == SETTLED_USAGE_RECORD_LIMIT {
+            self.settled_usage_records.pop_front();
+        }
+        self.settled_usage_records.push_back(usage);
+    }
+
     pub(crate) fn is_missing_usage(&self) -> bool {
         !self.session_owned_by_openclaw && self.has_own_activity && !self.has_supported_usage
     }
@@ -1332,21 +1308,105 @@ fn parse_codex_reader<R: BufRead>(
                     state.forked_child_inherited_baseline = None;
                     state.forked_child_inherited_reported_total = None;
 
-                    // The first token_count after a `compacted` item settles a
-                    // compaction record. If it emits usage for that same
-                    // response, it counts it and the record is confirmed below;
-                    // otherwise (Codex's non-advancing estimate) the record is
-                    // the only report of the compaction and is counted now.
-                    let emitted_usage =
-                        token_count_emitted_usage(total_usage, last_usage, state.previous_totals);
-                    let compaction_is_unreported = state
+                    // Zero and duplicate snapshots still prove that a supported
+                    // ledger exists, even when accounting emits no message.
+                    state.has_supported_usage |= has_supported_counters;
+
+                    // The usage this token_count emits, in whichever form the
+                    // snapshot reports it, and the baseline it leaves behind;
+                    // `None` when it emits nothing.
+                    let emitted = match (total_usage, last_usage, state.previous_totals) {
+                        // Both present with previous baseline (standard path)
+                        (Some(total), Some(last), Some(previous)) => {
+                            if total == previous
+                                || (total.delta_from(previous).is_none()
+                                    && total.looks_like_stale_regression(previous, last))
+                            {
+                                None
+                            } else {
+                                Some((last, Some(total)))
+                            }
+                        }
+                        // Both present, first event — use last (NOT full total) to
+                        // avoid overcounting tokens carried from a resumed session.
+                        (Some(total), Some(last), None) => Some((last, Some(total))),
+                        // Only total, have previous (defensive — upstream schema
+                        // requires both when info is present)
+                        (Some(total), None, Some(previous)) => {
+                            if total == previous {
+                                None
+                            } else if let Some(delta) = total.delta_from(previous) {
+                                Some((delta, Some(total)))
+                            } else {
+                                state.previous_totals = Some(total);
+                                None
+                            }
+                        }
+                        // Only total, first event, no last — legacy/degraded path
+                        (Some(total), None, None) => Some((total, Some(total))),
+                        // Only last, have previous
+                        (None, Some(last), Some(previous)) => {
+                            Some((last, Some(previous.saturating_add(last))))
+                        }
+                        // Only last, no previous
+                        (None, Some(last), None) => Some((last, None)),
+                        // Neither
+                        (None, None, _) => None,
+                    }
+                    // Skip zero-token snapshots without advancing the baseline so
+                    // that post-compaction zero totals don't inflate later deltas.
+                    .filter(|(usage, _)| {
+                        let tokens = usage.into_tokens();
+                        tokens.input != 0
+                            || tokens.output != 0
+                            || tokens.cache_read != 0
+                            || tokens.reasoning != 0
+                    });
+
+                    let Some((emitted_usage, next_totals)) = emitted else {
+                        // A token_count that emits nothing after `compacted`
+                        // (Codex's non-advancing estimate) did not report the
+                        // compaction, so its record is the only report of it.
+                        if state
+                            .pending_usage_record
+                            .as_ref()
+                            .is_some_and(|record| record.after_compacted)
+                        {
+                            emit_unconfirmed_usage_record(
+                                &mut state,
+                                session_id,
+                                fallback_timestamp,
+                                &mut messages,
+                                &mut fallback_timestamp_indices,
+                                &mut pending_model_messages,
+                            );
+                        }
+                        continue;
+                    };
+                    let tokens = emitted_usage.into_tokens();
+                    state.previous_totals = next_totals;
+
+                    // Settle the pending record against the usage this
+                    // token_count emits (see `pending_usage_record`).
+                    let reports_pending = state
                         .pending_usage_record
                         .as_ref()
-                        .filter(|record| record.after_compacted)
-                        .is_some_and(|record| {
-                            !emitted_usage.is_some_and(|usage| record.reported_by(usage))
-                        });
-                    if compaction_is_unreported {
+                        .is_some_and(|record| record.reported_by(emitted_usage));
+                    if reports_pending {
+                        // The same response: counted once, from here.
+                        state.pending_usage_record = None;
+                    } else if state.take_settled_usage_record(emitted_usage) {
+                        // A late report of a response whose record was
+                        // already counted on its own. The baseline moves on,
+                        // and any pending record waits for its own report.
+                        continue;
+                    } else if state
+                        .pending_usage_record
+                        .as_ref()
+                        .is_some_and(|record| record.after_compacted)
+                    {
+                        // This token_count reports another response, so the
+                        // compaction before it is counted from its record.
                         emit_unconfirmed_usage_record(
                             &mut state,
                             session_id,
@@ -1355,77 +1415,11 @@ fn parse_codex_reader<R: BufRead>(
                             &mut fallback_timestamp_indices,
                             &mut pending_model_messages,
                         );
+                    } else {
+                        // Outside compaction the next report confirms the
+                        // record by order (see `pending_usage_record`).
+                        state.pending_usage_record = None;
                     }
-
-                    // Zero and duplicate snapshots still prove that a supported
-                    // ledger exists, even when accounting emits no message.
-                    state.has_supported_usage |= has_supported_counters;
-
-                    let (tokens, next_totals) =
-                        match (total_usage, last_usage, state.previous_totals) {
-                            // Both present with previous baseline (standard path)
-                            (Some(total), Some(last), Some(previous)) => {
-                                if total == previous {
-                                    continue;
-                                }
-                                if total.delta_from(previous).is_none()
-                                    && total.looks_like_stale_regression(previous, last)
-                                {
-                                    continue;
-                                }
-                                (last.into_tokens(), Some(total))
-                            }
-                            // Both present, first event — use last (NOT full total) to
-                            // avoid overcounting tokens carried from a resumed session.
-                            (Some(total), Some(last), None) => (last.into_tokens(), Some(total)),
-                            // Only total, have previous (defensive — upstream schema
-                            // requires both when info is present)
-                            (Some(total), None, Some(previous)) => {
-                                if total == previous {
-                                    continue;
-                                }
-                                if let Some(delta) = total.delta_from(previous) {
-                                    (delta.into_tokens(), Some(total))
-                                } else {
-                                    state.previous_totals = Some(total);
-                                    continue;
-                                }
-                            }
-                            // Only total, first event, no last — legacy/degraded path
-                            (Some(total), None, None) => (total.into_tokens(), Some(total)),
-                            // Only last, have previous
-                            (None, Some(last), Some(previous)) => {
-                                (last.into_tokens(), Some(previous.saturating_add(last)))
-                            }
-                            // Only last, no previous
-                            (None, Some(last), None) => (last.into_tokens(), None),
-                            // Neither
-                            (None, None, _) => continue,
-                        };
-
-                    // Skip zero-token snapshots without advancing the baseline so
-                    // that post-compaction zero totals don't inflate later deltas.
-                    if tokens.input == 0
-                        && tokens.output == 0
-                        && tokens.cache_read == 0
-                        && tokens.reasoning == 0
-                    {
-                        continue;
-                    }
-
-                    state.previous_totals = next_totals;
-                    // A record emitted at a later turn boundary can receive its
-                    // matching token_count afterwards. It has already been
-                    // counted under its own durable key, so advance the normal
-                    // baseline but do not emit a second, differently keyed row.
-                    if emitted_usage
-                        .is_some_and(|usage| state.take_settled_usage_record_reported_by(usage))
-                    {
-                        continue;
-                    }
-                    // This token_count reports the response the pending
-                    // record describes, so the record is already counted.
-                    state.pending_usage_record = None;
 
                     let parsed_timestamp = parse_codex_entry_timestamp(entry.timestamp.as_deref());
                     let timestamp = state
@@ -1673,7 +1667,6 @@ fn emit_unconfirmed_usage_record(
     if tokens.input == 0 && tokens.output == 0 && tokens.cache_read == 0 && tokens.reasoning == 0 {
         return;
     }
-    state.remember_settled_usage_record(&record);
     let model = record.model.clone().or_else(|| state.current_model.clone());
     let timestamp = record.timestamp_ms.unwrap_or(fallback_timestamp);
     let mut message =
@@ -1714,12 +1707,15 @@ fn emit_unconfirmed_usage_record(
     );
     state.turn_coverage.record(record.turn_id.as_deref());
     state.has_supported_usage = true;
+    state.remember_settled_usage_record(record.usage);
     if model.is_some() {
         messages.push(message);
         if record.timestamp_ms.is_none() {
             fallback_timestamp_indices.push(messages.len() - 1);
         }
     } else {
+        // The row carries its own `codex:usage-record:` key, so the fallback
+        // identity a token_count row would need is not used.
         pending_model_messages.push(PendingCodexMessage {
             message,
             used_fallback_timestamp: record.timestamp_ms.is_none(),
@@ -5136,20 +5132,6 @@ mod tests {
         ) + "\n"
     }
 
-    fn last_only_token_count_line(ts: &str, last: (i64, i64, i64)) -> String {
-        format!(
-            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{}}}}}}}"#,
-            usage_json(last.0, last.1, last.2)
-        ) + "\n"
-    }
-
-    fn total_only_token_count_line(ts: &str, total: (i64, i64, i64)) -> String {
-        format!(
-            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{}}}}}}}"#,
-            usage_json(total.0, total.1, total.2)
-        ) + "\n"
-    }
-
     fn turn_lines(ts: &str, turn: &str) -> String {
         format!(
             r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_started","turn_id":"{turn}"}}}}"#
@@ -5185,95 +5167,6 @@ mod tests {
 
     fn total_tokens(messages: &[UnifiedMessage]) -> i64 {
         messages.iter().map(|m| m.tokens.total()).sum()
-    }
-
-    #[test]
-    fn test_compaction_matching_fallback_token_counts_are_counted_once() {
-        let last_only = create_test_file(
-            &(session_meta_line("codex_vscode")
-                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
-                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
-                + &token_count_line("2026-10-01T00:01:05.005Z", (100, 80, 10), (100, 80, 10))
-                + &record_line("2026-10-01T00:01:06Z", "turn-1", "resp-c", (500, 200, 40))
-                + &compacted_line("2026-10-01T00:01:06.010Z")
-                + &last_only_token_count_line("2026-10-01T00:01:06.020Z", (500, 200, 40))),
-        );
-        assert_eq!(
-            turn_totals(&parse_codex_file(last_only.path())),
-            vec![110, 540]
-        );
-
-        let total_only = create_test_file(
-            &(session_meta_line("codex_vscode")
-                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
-                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
-                + &token_count_line("2026-10-01T00:01:05.005Z", (100, 80, 10), (100, 80, 10))
-                + &record_line("2026-10-01T00:01:06Z", "turn-1", "resp-c", (500, 200, 40))
-                + &compacted_line("2026-10-01T00:01:06.010Z")
-                + &total_only_token_count_line("2026-10-01T00:01:06.020Z", (600, 280, 50))),
-        );
-        assert_eq!(
-            turn_totals(&parse_codex_file(total_only.path())),
-            vec![110, 540]
-        );
-    }
-
-    #[test]
-    fn test_compaction_does_not_match_a_different_usage_with_the_same_total() {
-        let file = create_test_file(
-            &(session_meta_line("codex_vscode")
-                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
-                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
-                + &token_count_line("2026-10-01T00:01:05.005Z", (100, 80, 10), (100, 80, 10))
-                + &record_line("2026-10-01T00:01:06Z", "turn-1", "resp-c", (500, 200, 40))
-                + &compacted_line("2026-10-01T00:01:06.010Z")
-                // The later response has the same input + output total (540),
-                // but it is not the compaction response.
-                + &token_count_line("2026-10-01T00:01:06.020Z", (500, 280, 150), (400, 200, 140))),
-        );
-
-        assert_eq!(
-            turn_totals(&parse_codex_file(file.path())),
-            vec![110, 540, 540]
-        );
-    }
-
-    #[test]
-    fn test_late_confirmation_after_turn_boundary_is_counted_once_after_cached_append() {
-        let head = session_meta_line("codex_vscode")
-            + &turn_lines("2026-10-01T23:58:00Z", "turn-1")
-            + &record_line("2026-10-01T23:58:05Z", "turn-1", "resp-1", (100, 80, 10))
-            + &token_count_line("2026-10-01T23:58:05.005Z", (100, 80, 10), (100, 80, 10))
-            + &record_line(
-                "2026-10-01T23:59:59Z",
-                "turn-1",
-                "resp-late",
-                (500, 200, 40),
-            )
-            + &turn_lines("2026-10-02T00:00:00Z", "turn-2");
-        let tail = token_count_line("2026-10-02T00:00:01Z", (600, 280, 50), (500, 200, 40));
-        let mut file = create_test_file(&head);
-        let initial_size = file.as_file().metadata().unwrap().len();
-        let initial = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
-        assert_eq!(turn_totals(&initial.messages), vec![110, 540]);
-
-        // The state is persisted by the source cache between scans.
-        let cached_state: CodexParseState =
-            serde_json::from_str(&serde_json::to_string(&initial.state).unwrap()).unwrap();
-        file.write_all(tail.as_bytes()).unwrap();
-        file.flush().unwrap();
-        let appended = parse_codex_file_incremental(file.path(), initial_size, cached_state);
-        let mut incremental = initial.messages;
-        incremental.extend(appended.messages);
-        let full = parse_codex_file(file.path());
-
-        assert_eq!(turn_totals(&incremental), vec![110, 540]);
-        assert_eq!(incremental, full);
-        assert_eq!(
-            full[1].timestamp,
-            parse_codex_entry_timestamp(Some("2026-10-01T23:59:59Z")).unwrap(),
-            "the late confirmation must not move the response into the next UTC day"
-        );
     }
 
     #[test]
@@ -5877,5 +5770,238 @@ mod tests {
             "the compaction is the first reply"
         );
         assert!(!messages[1].is_turn_start);
+    }
+
+    fn total_only_token_count_line(ts: &str, total: (i64, i64, i64)) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{}}}}}}}"#,
+            usage_json(total.0, total.1, total.2)
+        ) + "\n"
+    }
+
+    fn last_only_token_count_line(ts: &str, last: (i64, i64, i64)) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{}}}}}}}"#,
+            usage_json(last.0, last.1, last.2)
+        ) + "\n"
+    }
+
+    fn utc_day(timestamp_ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(timestamp_ms)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    #[test]
+    fn test_compaction_confirmed_by_a_last_only_token_count_is_counted_once() {
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:02:00Z", "turn-2")
+                + &record_line("2026-10-01T00:02:00.005Z", "turn-2", "resp-2", (500, 0, 40))
+                + &compacted_line("2026-10-01T00:02:00.010Z")
+                + &last_only_token_count_line("2026-10-01T00:02:00.020Z", (500, 0, 40))),
+        );
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(turn_totals(&messages), vec![540]);
+        assert!(messages[0]
+            .dedup_key
+            .as_deref()
+            .unwrap()
+            .starts_with("codex:token_count"));
+    }
+
+    #[test]
+    fn test_compaction_confirmed_by_a_total_only_token_count_is_counted_once() {
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
+                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
+                + &token_count_line("2026-10-01T00:01:05.005Z", (100, 80, 10), (100, 80, 10))
+                + &record_line(
+                    "2026-10-01T00:02:00.005Z",
+                    "turn-1",
+                    "resp-2",
+                    (500, 200, 40),
+                )
+                + &compacted_line("2026-10-01T00:02:00.010Z")
+                + &total_only_token_count_line("2026-10-01T00:02:00.020Z", (600, 280, 50))),
+        );
+
+        assert_eq!(turn_totals(&parse_codex_file(file.path())), vec![110, 540]);
+    }
+
+    #[test]
+    fn test_compaction_confirmed_by_a_last_only_token_count_after_a_baseline_is_counted_once() {
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
+                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
+                + &token_count_line("2026-10-01T00:01:05.005Z", (100, 80, 10), (100, 80, 10))
+                + &record_line(
+                    "2026-10-01T00:02:00.005Z",
+                    "turn-1",
+                    "resp-2",
+                    (500, 200, 40),
+                )
+                + &compacted_line("2026-10-01T00:02:00.010Z")
+                + &last_only_token_count_line("2026-10-01T00:02:00.020Z", (500, 200, 40))),
+        );
+
+        assert_eq!(turn_totals(&parse_codex_file(file.path())), vec![110, 540]);
+    }
+
+    #[test]
+    fn test_compaction_is_not_confirmed_by_a_response_with_the_same_token_sum() {
+        // (500 in, 40 out) and (400 in, 140 out) both sum to 540; they are
+        // different responses, so the compaction is counted from its record.
+        let file = create_test_file(
+            &(session_meta_line("codex_vscode")
+                + &turn_lines("2026-10-01T00:01:00Z", "turn-1")
+                + &record_line("2026-10-01T00:01:05Z", "turn-1", "resp-1", (100, 80, 10))
+                + &token_count_line("2026-10-01T00:01:05.005Z", (100, 80, 10), (100, 80, 10))
+                + &record_line(
+                    "2026-10-01T00:02:00.005Z",
+                    "turn-1",
+                    "resp-c",
+                    (500, 200, 40),
+                )
+                + &compacted_line("2026-10-01T00:02:00.010Z")
+                + &token_count_line("2026-10-01T00:02:00.020Z", (500, 80, 150), (400, 0, 140))),
+        );
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(turn_totals(&messages), vec![110, 540, 540]);
+        assert_eq!(
+            messages[1].dedup_key.as_deref(),
+            Some(format!("codex:usage-record:{COMPACTION_THREAD}:resp-c").as_str())
+        );
+        assert_eq!(
+            (messages[2].tokens.input, messages[2].tokens.output),
+            (400, 140)
+        );
+    }
+
+    /// Turn 1 answers; turn 2's response is recorded just before UTC
+    /// midnight; turn 3 starts before turn 2's token_count is written, and
+    /// that token_count arrives late, then turn 3 answers.
+    fn late_confirmation_rollout() -> (String, String) {
+        let head = session_meta_line("codex_vscode")
+            + &turn_lines("2026-10-01T23:58:00Z", "turn-1")
+            + &record_line("2026-10-01T23:58:05Z", "turn-1", "resp-1", (100, 80, 10))
+            + &token_count_line("2026-10-01T23:58:05.005Z", (100, 80, 10), (100, 80, 10))
+            + &turn_lines("2026-10-01T23:59:00Z", "turn-2")
+            + &record_line(
+                "2026-10-01T23:59:59.500Z",
+                "turn-2",
+                "resp-2",
+                (500, 200, 40),
+            )
+            + &turn_lines("2026-10-02T00:00:01Z", "turn-3");
+        let tail = token_count_line("2026-10-02T00:00:01.500Z", (600, 280, 50), (500, 200, 40))
+            + &record_line("2026-10-02T00:00:05Z", "turn-3", "resp-3", (30, 0, 3))
+            + &token_count_line("2026-10-02T00:00:05.005Z", (630, 280, 53), (30, 0, 3));
+        (head, tail)
+    }
+
+    #[test]
+    fn test_late_token_count_for_a_record_already_counted_adds_nothing() {
+        let (head, tail) = late_confirmation_rollout();
+        let file = create_test_file(&(head + &tail));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(turn_totals(&messages), vec![110, 540, 33]);
+        assert_eq!(
+            messages[1].dedup_key.as_deref(),
+            Some(format!("codex:usage-record:{COMPACTION_THREAD}:resp-2").as_str())
+        );
+        assert_eq!(utc_day(messages[1].timestamp), "2026-10-01");
+    }
+
+    #[test]
+    fn test_late_token_count_does_not_take_the_next_turns_pending_record() {
+        // Turn 3's record is already pending when turn 2's late token_count
+        // arrives; the late report settles nothing for turn 3.
+        let (head, _) = late_confirmation_rollout();
+        let file = create_test_file(
+            &(head
+                + &record_line("2026-10-02T00:00:01.200Z", "turn-3", "resp-3", (30, 0, 3))
+                + &token_count_line("2026-10-02T00:00:01.500Z", (600, 280, 50), (500, 200, 40))
+                + &token_count_line("2026-10-02T00:00:05.005Z", (630, 280, 53), (30, 0, 3))),
+        );
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(turn_totals(&messages), vec![110, 540, 33]);
+        assert!(messages[2]
+            .dedup_key
+            .as_deref()
+            .unwrap()
+            .starts_with("codex:token_count"));
+    }
+
+    #[test]
+    fn test_late_token_count_across_incremental_chunks_matches_full_parse() {
+        let (head, tail) = late_confirmation_rollout();
+        let full = head.clone() + &tail;
+        let whole = parse_codex_file(create_test_file(&full).path());
+        let whole_rows: Vec<(i64, String)> = whole
+            .iter()
+            .map(|m| (m.tokens.total(), utc_day(m.timestamp)))
+            .collect();
+        assert_eq!(
+            whole_rows,
+            vec![
+                (110, "2026-10-01".to_string()),
+                (540, "2026-10-01".to_string()),
+                (33, "2026-10-02".to_string())
+            ]
+        );
+
+        // Split after the record (still pending) and after the next turn's
+        // start (already emitted and remembered as settled).
+        let after_record = head
+            .rfind(r#""type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3""#)
+            .unwrap();
+        let after_record = head[..after_record].rfind('\n').unwrap() + 1;
+        for cut in [after_record, head.len()] {
+            let mut file = create_test_file(&full[..cut]);
+            let first = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+            let state: CodexParseState =
+                serde_json::from_str(&serde_json::to_string(&first.state).unwrap()).unwrap();
+            file.write_all(&full.as_bytes()[cut..]).unwrap();
+            file.flush().unwrap();
+            let second = parse_codex_file_incremental(file.path(), first.consumed_offset, state);
+            let rows: Vec<(i64, String)> = first
+                .messages
+                .iter()
+                .chain(second.messages.iter())
+                .map(|m| (m.tokens.total(), utc_day(m.timestamp)))
+                .collect();
+            assert_eq!(rows, whole_rows, "cut at byte {cut}");
+        }
+    }
+
+    #[test]
+    fn test_settled_usage_records_are_bounded() {
+        let mut state = CodexParseState::default();
+        for input in 0..(SETTLED_USAGE_RECORD_LIMIT as i64 + 4) {
+            state.remember_settled_usage_record(CodexTotals {
+                input,
+                output: 1,
+                cached: 0,
+                reasoning: 0,
+            });
+        }
+
+        assert_eq!(
+            state.settled_usage_records.len(),
+            SETTLED_USAGE_RECORD_LIMIT
+        );
+        assert_eq!(state.settled_usage_records.front().unwrap().input, 4);
     }
 }
